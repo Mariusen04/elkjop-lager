@@ -307,41 +307,172 @@ with st.sidebar:
                 encoding="utf-8",
             )
 
-            with st.spinner(
-                "Kjører lageranalysen. Dette kan ta noen minutter ..."
-            ):
-                with open(
-                    LOG_FILE,
-                    "a",
-                    encoding="utf-8",
-                ) as log:
-                    process = subprocess.run(
-                        [
-                            sys.executable,
-                            str(BOT_FILE),
-                        ],
-                        cwd=str(APP_DIR),
-                        text=True,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
+            st.subheader("Status")
+
+            progress_bar = st.progress(
+                0,
+                text="Starter analysen ..."
+            )
+
+            status_box = st.empty()
+            detail_box = st.empty()
+
+            live_log = st.empty()
+
+            current_category = 0
+            total_categories = 629
+            current_worker = ""
+            total_unique = 0
+            last_lines = []
+
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(BOT_FILE),
+                ],
+                cwd=str(APP_DIR),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+
+            with open(
+                LOG_FILE,
+                "a",
+                encoding="utf-8",
+            ) as log:
+                assert process.stdout is not None
+
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip("\n")
+
+                    log.write(raw_line)
+                    log.flush()
+
+                    last_lines.append(line)
+
+                    if len(last_lines) > 18:
+                        last_lines = last_lines[-18:]
+
+                    worker_match = re.search(
+                        r"WORKER\s+(\d+)-(\d+)\s+av\s+(\d+)",
+                        line,
                     )
 
-                    log.write(
-                        "\n\n"
-                        "===== PROCESS EXIT CODE: "
-                        f"{process.returncode} =====\n"
+                    if worker_match:
+                        current_worker = (
+                            f"Worker {worker_match.group(1)}–"
+                            f"{worker_match.group(2)}"
+                        )
+
+                    category_match = re.search(
+                        r"\[(\d+)/(\d+)\]\s+([^\s]+)\s+\(([^)]+)\)",
+                        line,
                     )
 
-            if process.returncode == 0:
-                st.success("Analysen er ferdig.")
-                st.rerun()
-            else:
-                st.error(
-                    "Analysen feilet. "
-                    f"Exit code: {process.returncode}"
+                    if category_match:
+                        current_category = int(
+                            category_match.group(1)
+                        )
+
+                        total_categories = int(
+                            category_match.group(2)
+                        )
+
+                        category_name = (
+                            category_match.group(3)
+                        )
+
+                        category_count = (
+                            category_match.group(4)
+                        )
+
+                        percent = min(
+                            current_category
+                            / max(total_categories, 1),
+                            1.0,
+                        )
+
+                        progress_bar.progress(
+                            percent,
+                            text=(
+                                f"{current_category}/{total_categories} "
+                                f"({percent * 100:.1f} %)"
+                            ),
+                        )
+
+                        status_box.info(
+                            f"Behandler **{category_name}** "
+                            f"({category_count})"
+                        )
+
+                    unique_match = re.search(
+                        r"TOTALT UNIKE:\s*([\d,\. ]+)",
+                        line,
+                    )
+
+                    if unique_match:
+                        raw_number = (
+                            unique_match.group(1)
+                            .replace(",", "")
+                            .replace(".", "")
+                            .replace(" ", "")
+                        )
+
+                        if raw_number.isdigit():
+                            total_unique = int(raw_number)
+
+                    details = []
+
+                    if current_worker:
+                        details.append(current_worker)
+
+                    if total_unique:
+                        details.append(
+                            f"{total_unique:,} unike SKU-er"
+                            .replace(",", " ")
+                        )
+
+                    if details:
+                        detail_box.caption(
+                            " • ".join(details)
+                        )
+
+                    live_log.code(
+                        "\n".join(last_lines),
+                        language=None,
+                    )
+
+            returncode = process.wait()
+
+            with open(
+                LOG_FILE,
+                "a",
+                encoding="utf-8",
+            ) as log:
+                log.write(
+                    "\n\n"
+                    "===== PROCESS EXIT CODE: "
+                    f"{returncode} =====\n"
                 )
 
-                if process.returncode in (-9, 137):
+            if returncode == 0:
+                progress_bar.progress(
+                    1.0,
+                    text="100 % – ferdig"
+                )
+                status_box.success(
+                    "✅ Analysen er ferdig."
+                )
+                st.rerun()
+            else:
+                status_box.error(
+                    "Analysen feilet. "
+                    f"Exit code: {returncode}"
+                )
+
+                if returncode in (-9, 137):
                     st.warning(
                         "Prosessen ble drept av systemet. "
                         "Dette skyldes ofte RAM-grensen."

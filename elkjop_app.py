@@ -29,216 +29,175 @@ def classify_product(category, title):
     """
     Returnerer (avdeling, underkategori).
 
-    Kategorinavnet fra Elkjøp brukes først.
-    Produktnavnet brukes som ekstra hjelp hvis kategorien er uklar.
+    Viktig:
+    1. Elkjøp-kategorien får høyest prioritet.
+    2. Produktnavnet brukes bare som fallback.
+    3. PC/Mobil/Lyd osv. sjekkes før TV, så en PC ikke havner i TV
+       bare fordi produktnavnet tilfeldigvis inneholder "TV".
     """
-    text = f"{category} {title}".lower()
 
-    def has_keyword(keyword):
-        # Match hele ord/uttrykk, ikke tilfeldige bokstaver inni andre ord.
-        # Eksempel: "tv" skal IKKE treffe "nettverk".
+    category_text = str(category or "").lower()
+    title_text = str(title or "").lower()
+
+    def has(text, keyword):
         pattern = rf"(?<![a-z0-9æøå]){re.escape(keyword.lower())}(?![a-z0-9æøå])"
         return re.search(pattern, text) is not None
 
-    # -------------------------
-    # TECH
-    # -------------------------
-    tech_rules = [
-        (
-            "TV",
-            [
-                "tv", "oled", "qled", "miniled", "mini-led",
-                "fjernsyn", "tv-veggfeste", "veggfeste til tv",
-            ],
-        ),
-        (
-            "Mobil",
-            [
-                "mobiltelefon", "smarttelefon", "iphone",
-                "androidtelefon", "mobil tilbehør", "mobildeksel",
-                "skjermbeskytter", "mobillader",
-            ],
-        ),
-        (
-            "PC",
-            [
-                "bærbar pc", "laptop", "desktop", "stasjonær pc",
-                "gaming pc", "chromebook", "macbook", "imac",
-                "pc-skjerm", "monitor", "dataskjerm",
-            ],
-        ),
-        (
-            "Nettbrett",
-            [
-                "nettbrett", "tablet", "ipad",
-            ],
-        ),
-        (
-            "Lyd",
-            [
-                "lydplanke", "soundbar", "høyttaler", "høyttalere",
-                "hodetelefon", "ørepropper", "headset", "radio",
-                "stereo", "forsterker", "subwoofer", "multiroom",
-                "sonos", "bluetooth-høyttaler",
-            ],
-        ),
-        (
-            "Gaming",
-            [
-                "gaming", "playstation", "xbox", "nintendo",
-                "spillkonsoll", "gamingmus", "gamingtastatur",
-                "gaming-headset", "gamingstol", "ratt og pedaler",
-            ],
-        ),
-        (
-            "Foto & video",
-            [
-                "kamera", "digitalkamera", "systemkamera",
-                "actionkamera", "videokamera", "objektiv",
-                "fototilbehør",
-            ],
-        ),
-        (
-            "Smartklokke & wearables",
-            [
-                "smartklokke", "smartwatch", "aktivitetsarmbånd",
-                "fitnessklokke", "apple watch",
-            ],
-        ),
-        (
-            "Nettverk & smarthjem",
-            [
-                "router", "ruter", "mesh", "wifi", "wi-fi",
-                "nettverk", "switch", "aksesspunkt", "access point",
-                "smarthjem", "smart home", "overvåkningskamera",
-                "ringeklokke", "smartpære", "smart lys",
-            ],
-        ),
-        (
-            "Tech-tilbehør",
-            [
-                "hdmi", "usb", "usb-c", "kabel", "adapter",
-                "minnekort", "harddisk", "ssd", "m.2",
-                "powerbank", "lader", "dock", "docking",
-                "tastatur", "mus", "webkamera",
-            ],
-        ),
+    def any_has(text, keywords):
+        return any(has(text, keyword) for keyword in keywords)
+
+    # ========================================================
+    # STERKE REGLER BASERT PÅ ELKJØP-KATEGORIEN
+    # ========================================================
+
+    category_rules = [
+        # TECH - PC først
+        ("Tech", "PC", [
+            "bærbar pc", "laptop", "stasjonær pc", "desktop",
+            "gaming pc", "chromebook", "macbook", "imac",
+            "pc-skjerm", "pc skjerm", "monitor", "dataskjerm",
+            "pc-tilbehør", "pc tilbehør",
+        ]),
+        ("Tech", "Mobil", [
+            "mobiltelefon", "smarttelefon", "iphone",
+            "mobil tilbehør", "mobiltilbehør", "mobildeksel",
+            "skjermbeskytter",
+        ]),
+        ("Tech", "Nettbrett", [
+            "nettbrett", "tablet", "ipad",
+        ]),
+        ("Tech", "Gaming", [
+            "gaming", "playstation", "xbox", "nintendo",
+            "spillkonsoll", "gamingmus", "gamingtastatur",
+            "gaming-headset", "gaming headset", "gamingstol",
+            "ratt og pedaler",
+        ]),
+        ("Tech", "Lyd", [
+            "lydplanke", "soundbar", "høyttaler", "høyttalere",
+            "hodetelefon", "ørepropper", "headset", "radio",
+            "stereo", "forsterker", "subwoofer", "multiroom",
+            "bluetooth-høyttaler",
+        ]),
+        ("Tech", "Foto & video", [
+            "kamera", "digitalkamera", "systemkamera",
+            "actionkamera", "videokamera", "objektiv",
+            "fototilbehør",
+        ]),
+        ("Tech", "Smartklokke & wearables", [
+            "smartklokke", "smartwatch", "aktivitetsarmbånd",
+            "fitnessklokke", "apple watch",
+        ]),
+        ("Tech", "Nettverk & smarthjem", [
+            "router", "ruter", "mesh", "wifi", "wi-fi",
+            "nettverk", "switch", "aksesspunkt", "access point",
+            "smarthjem", "smart home", "overvåkningskamera",
+            "ringeklokke",
+        ]),
+        # TV kommer ETTER andre Tech-kategorier
+        ("Tech", "TV", [
+            "tv", "oled tv", "qled tv", "mini-led tv",
+            "miniled tv", "fjernsyn", "tv-veggfeste",
+            "veggfeste til tv", "tv-tilbehør", "tv tilbehør",
+        ]),
+
+        # HVITEVARER
+        ("Hvitevarer", "Kjøl & frys", [
+            "kjøleskap", "kombiskap", "fryser", "fryseskap",
+            "fryseboks", "vinskap",
+        ]),
+        ("Hvitevarer", "Vask & tørk", [
+            "vaskemaskin", "tørketrommel", "kombinert vask",
+            "vask/tørk", "tørkeskap",
+        ]),
+        ("Hvitevarer", "Oppvask", [
+            "oppvaskmaskin", "oppvask",
+        ]),
+        ("Hvitevarer", "Komfyr & ovn", [
+            "komfyr", "stekeovn", "mikrobølgeovn", "mikroovn",
+        ]),
+        ("Hvitevarer", "Platetopp", [
+            "platetopp", "induksjonstopp", "koketopp",
+        ]),
+        ("Hvitevarer", "Ventilator", [
+            "ventilator", "kjøkkenvifte",
+        ]),
+
+        # SDA
+        ("SDA", "Støvsuger & rengjøring", [
+            "støvsuger", "robotstøvsuger", "skaftstøvsuger",
+            "håndstøvsuger", "gulvvasker", "damprenser",
+            "vindusvasker",
+        ]),
+        ("SDA", "Kaffe", [
+            "kaffemaskin", "kaffetrakter", "espressomaskin",
+            "kaffekvern", "kapselmaskin", "melkeskummer",
+        ]),
+        ("SDA", "Kjøkkenapparater", [
+            "airfryer", "air fryer", "blender", "stavmikser",
+            "kjøkkenmaskin", "foodprosessor", "brødrister",
+            "vannkoker", "riskoker", "slow cooker",
+            "multicooker", "toastjern", "vaffeljern",
+            "fritøse", "juicepresse", "sitruspresse",
+            "iskremmaskin", "kjøkkenvekt",
+        ]),
+        ("SDA", "Personlig pleie", [
+            "barbermaskin", "trimmer", "hårklipper",
+            "hårføner", "rettetang", "krølltang",
+            "elektrisk tannbørste", "tannbørste", "epilator",
+        ]),
+        ("SDA", "Stryking & tekstil", [
+            "strykejern", "tøydamper", "steamer", "dampstasjon",
+        ]),
+        ("SDA", "Inneklima", [
+            "bordvifte", "gulvvifte", "luftfukter", "luftrenser",
+            "avfukter", "varmeovn", "panelovn", "aircondition",
+            "air conditioner",
+        ]),
     ]
 
-    # -------------------------
-    # HVITEVARER
-    # -------------------------
-    whitegoods_rules = [
-        (
-            "Kjøl & frys",
-            [
-                "kjøleskap", "kombiskap", "fryser", "fryseskap",
-                "fryseboks", "vinskap", "kjøl", "frys",
-            ],
-        ),
-        (
-            "Vask & tørk",
-            [
-                "vaskemaskin", "tørketrommel", "kombinert vask",
-                "vask/tørk", "tørkeskap",
-            ],
-        ),
-        (
-            "Oppvask",
-            [
-                "oppvaskmaskin", "oppvask",
-            ],
-        ),
-        (
-            "Komfyr & ovn",
-            [
-                "komfyr", "stekeovn", "ovn", "mikrobølgeovn",
-                "mikroovn",
-            ],
-        ),
-        (
-            "Platetopp",
-            [
-                "platetopp", "induksjonstopp", "koketopp",
-            ],
-        ),
-        (
-            "Ventilator",
-            [
-                "ventilator", "kjøkkenvifte", "hette",
-            ],
-        ),
+    for department, subcategory, keywords in category_rules:
+        if any_has(category_text, keywords):
+            return department, subcategory
+
+    # ========================================================
+    # FALLBACK PÅ PRODUKTNAVN
+    # ========================================================
+    # Bevisst rekkefølge: PC/Mobil/etc før TV.
+    title_rules = [
+        ("Tech", "PC", [
+            "laptop", "notebook", "chromebook", "macbook",
+            "desktop", "gaming pc", "pc monitor", "pc-skjerm",
+        ]),
+        ("Tech", "Mobil", [
+            "iphone", "smartphone", "mobiltelefon",
+        ]),
+        ("Tech", "Nettbrett", [
+            "ipad", "tablet", "nettbrett",
+        ]),
+        ("Tech", "Gaming", [
+            "playstation", "xbox", "nintendo",
+        ]),
+        ("Tech", "Lyd", [
+            "soundbar", "høyttaler", "headset", "hodetelefon",
+            "earbuds", "ørepropper", "subwoofer",
+        ]),
+        ("Tech", "Nettverk & smarthjem", [
+            "router", "ruter", "mesh", "wi-fi", "wifi",
+        ]),
+        ("Tech", "TV", [
+            "oled tv", "qled tv", "mini-led tv", "smart tv",
+        ]),
+        ("SDA", "Støvsuger & rengjøring", [
+            "støvsuger", "robotstøvsuger",
+        ]),
+        ("SDA", "Kaffe", [
+            "kaffemaskin", "kaffetrakter", "espresso",
+        ]),
     ]
 
-    # -------------------------
-    # SDA = småvarer utenom Tech
-    # -------------------------
-    sda_rules = [
-        (
-            "Støvsuger & rengjøring",
-            [
-                "støvsuger", "robotstøvsuger", "skaftstøvsuger",
-                "håndstøvsuger", "gulvvasker", "damprenser",
-                "vindusvasker", "rengjøring",
-            ],
-        ),
-        (
-            "Kaffe",
-            [
-                "kaffemaskin", "kaffetrakter", "espressomaskin",
-                "kaffekvern", "kapselmaskin", "melkeskummer",
-            ],
-        ),
-        (
-            "Kjøkkenapparater",
-            [
-                "airfryer", "air fryer", "blender", "stavmikser",
-                "kjøkkenmaskin", "foodprosessor", "brødrister",
-                "vannkoker", "riskoker", "slow cooker",
-                "multicooker", "toastjern", "vaffeljern",
-                "grill", "fritøse", "juicepresse", "sitruspresse",
-                "iskremmaskin", "kjøkkenvekt",
-            ],
-        ),
-        (
-            "Personlig pleie",
-            [
-                "barbermaskin", "trimmer", "hårklipper",
-                "hårføner", "rettetang", "krølltang",
-                "elektrisk tannbørste", "tannbørste",
-                "personlig pleie", "epilator",
-            ],
-        ),
-        (
-            "Stryking & tekstil",
-            [
-                "strykejern", "tøydamper", "steamer",
-                "dampstasjon",
-            ],
-        ),
-        (
-            "Inneklima",
-            [
-                "vifte", "bordvifte", "gulvvifte",
-                "luftfukter", "luftrenser", "avfukter",
-                "varmeovn", "panelovn", "aircondition",
-                "air conditioner",
-            ],
-        ),
-    ]
-
-    # Hvitevarer først for å unngå at f.eks. "ovn" havner i SDA.
-    for subcategory, keywords in whitegoods_rules:
-        if any(has_keyword(keyword) for keyword in keywords):
-            return "Hvitevarer", subcategory
-
-    for subcategory, keywords in tech_rules:
-        if any(has_keyword(keyword) for keyword in keywords):
-            return "Tech", subcategory
-
-    for subcategory, keywords in sda_rules:
-        if any(has_keyword(keyword) for keyword in keywords):
-            return "SDA", subcategory
+    for department, subcategory, keywords in title_rules:
+        if any_has(title_text, keywords):
+            return department, subcategory
 
     return "Annet", category if str(category).strip() else "Ukjent"
 

@@ -68,11 +68,23 @@ with st.sidebar:
                         stderr=subprocess.STDOUT,
                     )
 
-            if process.returncode == 0:
-                st.success("Analysen er ferdig.")
-                st.rerun()
-            else:
-                st.error("Analysen feilet. Se loggen under.")
+          with open(LOG_FILE, "a", encoding="utf-8") as log:
+    log.write(
+        f"\n\n===== PROCESS EXIT CODE: {process.returncode} =====\n"
+    )
+
+if process.returncode == 0:
+    st.success("Analysen er ferdig.")
+    st.rerun()
+else:
+    st.error(
+        f"Analysen feilet. Exit code: {process.returncode}"
+    )
+
+    if process.returncode in (-9, 137):
+        st.warning(
+            "Prosessen ble sannsynligvis drept pga. for lite RAM."
+        )
 
     if LOG_FILE.exists():
         with st.expander("Vis siste analyselog"):

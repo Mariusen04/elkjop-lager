@@ -38,7 +38,7 @@ MAX_SPLIT_DEPTH = 10
 
 # Viktig for Railway: hver worker avsluttes helt etter noen kategorier,
 # slik at Linux frigjør hele prosessens RAM.
-WORKER_CHUNK_SIZE = 200
+WORKER_CHUNK_SIZE = 350
 
 KEY_REFRESH_MARGIN = 75
 SPLIT_TOLERANCE_PERCENT = 0.005

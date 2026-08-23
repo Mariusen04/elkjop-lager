@@ -321,14 +321,22 @@ st.caption(
 # KJØR ANALYSE
 # ============================================================
 
-with st.sidebar:
-    st.header("Analyse")
-
+@st.fragment(run_every="2s")
+def render_analysis_controls():
     lock_info = read_analysis_lock()
     analysis_log = read_analysis_log()
     analysis_status = read_analysis_status()
 
+    if not lock_info and st.session_state.pop(
+        "analysis_was_running",
+        False,
+    ):
+        # Oppdater også rapporttidspunkt, tabell og nøkkeltall når jobben
+        # er ferdig. Et vanlig st.rerun() fra et fragment kjører hele appen.
+        st.rerun()
+
     if lock_info:
+        st.session_state["analysis_was_running"] = True
         started_at = lock_info.get("started_at")
         started_text = (
             format_timestamp(started_at)
@@ -364,8 +372,7 @@ with st.sidebar:
 
             st.caption(" • ".join(details))
 
-        if st.button("🔄 Oppdater status", width="stretch"):
-            st.rerun()
+        st.caption("Status oppdateres automatisk hvert 2. sekund.")
     elif analysis_status.get("status") == "error":
         finished_at = analysis_status.get("finished_at")
         finished_text = (
@@ -446,7 +453,12 @@ with st.sidebar:
 
     if LOG_FILE.exists():
         with st.expander("Vis siste analyselog"):
-            st.code(analysis_log or read_analysis_log())
+            st.code(read_analysis_log())
+
+
+with st.sidebar:
+    st.header("Analyse")
+    render_analysis_controls()
 
     st.divider()
 

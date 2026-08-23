@@ -21,6 +21,7 @@ Elkjøp Stord ikke har på lager, men som mange andre butikker har.
 - knapp for å kjøre ny analyse
 - tapsfri katalogpassering uten sekvensielle worker-prosesser
 - analysen fortsetter på serveren selv om nettleseren lukkes
+- analysestatus og rapport oppdateres automatisk mens jobben kjører
 - beskytter mot flere samtidige analyser
 - beholder forrige rapport til en ny rapport er ferdig
 - støtte for persistent Railway-volume

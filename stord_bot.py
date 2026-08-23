@@ -29,12 +29,13 @@ EXCLUDE_STORE_WORDS = ["Phonehouse", "Outlet"]
 ALGOLIA_APP_ID = "Z0FL7R8UBH"
 INDEX_NAME = "commerce_b2c_OCNOELK"
 ALGOLIA_URL = "https://z0fl7r8ubh-dsn.algolia.net/1/indexes/*/queries"
+ALGOLIA_KEY_URL = "https://www.elkjop.no/api/algolia/signed-api-key"
 STOREFINDER_URL = "https://www.elkjop.no/api/trpc/location.getStoreFinderStores"
 
 MAX_RETRIEVABLE = 1500
 PARTITION_TARGET = 1400
 MAX_FILTER_VALUES_PER_GROUP = 200
-HITS_PER_PAGE = 500
+HITS_PER_PAGE = 1000
 MAX_SPLIT_DEPTH = 10
 
 KEY_REFRESH_MARGIN = 75
@@ -62,7 +63,6 @@ PRODUCT_ATTRIBUTES = [
     "sellerName",
     "urlB2C",
     "storesWithStock",
-    "departmentStock",
     "wholesalesStatus",
     "retailSalesStatus",
     "isBuyableInStore",
@@ -162,8 +162,33 @@ def decode_key_valid_until(key):
         return None
 
 
-def get_fresh_algolia_key():
-    print("\n🔑 Henter fersk Algolia-nøkkel automatisk ...", flush=True)
+def get_algolia_key_with_http():
+    response = session.get(
+        ALGOLIA_KEY_URL,
+        headers={
+            "accept": "application/json",
+            "referer": "https://www.elkjop.no/",
+            "user-agent": "Mozilla/5.0",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    key = str(payload.get("apiKey", "") or "").strip()
+
+    if len(key) <= 50:
+        raise RuntimeError("Nøkkel-endepunktet returnerte ingen gyldig nøkkel.")
+
+    valid_until = decode_key_valid_until(key)
+    if valid_until and valid_until - time.time() <= KEY_REFRESH_MARGIN:
+        raise RuntimeError(
+            "Nøkkel-endepunktet returnerte en utløpt nøkkel."
+        )
+
+    return key
+
+
+def get_algolia_key_with_browser():
     found_key = None
 
     with sync_playwright() as p:
@@ -210,7 +235,21 @@ def get_fresh_algolia_key():
             except Exception:
                 pass
 
+        def handle_response(response):
+            nonlocal found_key
+
+            if "/api/algolia/signed-api-key" not in response.url:
+                return
+
+            try:
+                key = str(response.json().get("apiKey", "") or "").strip()
+                if len(key) > 50:
+                    found_key = key
+            except Exception:
+                pass
+
         page.on("request", handle_request)
+        page.on("response", handle_response)
 
         for url in [
             "https://www.elkjop.no/",
@@ -242,21 +281,40 @@ def get_fresh_algolia_key():
 
         browser.close()
 
-    gc.collect()
-
     if not found_key:
         raise RuntimeError("Fant ikke Algolia-nøkkel automatisk.")
+
+    return found_key
+
+
+def get_fresh_algolia_key():
+    print("\n🔑 Henter fersk Algolia-nøkkel automatisk ...", flush=True)
+
+    try:
+        found_key = get_algolia_key_with_http()
+        source = "direkte"
+    except Exception as error:
+        print(
+            f"⚠ Direkte nøkkelhenting feilet ({error}). "
+            "Prøver nettleser-reserven ...",
+            flush=True,
+        )
+        found_key = get_algolia_key_with_browser()
+        source = "via nettleser-reserve"
+
+    gc.collect()
 
     valid_until = decode_key_valid_until(found_key)
 
     if valid_until:
         left = max(0, int(valid_until - time.time()))
         print(
-            f"✓ Fersk nøkkel funnet ({left // 60} min {left % 60} sek igjen)",
+            f"✓ Fersk nøkkel funnet {source} "
+            f"({left // 60} min {left % 60} sek igjen)",
             flush=True,
         )
     else:
-        print("✓ Fersk Algolia-nøkkel funnet.", flush=True)
+        print(f"✓ Fersk Algolia-nøkkel funnet {source}.", flush=True)
 
     return found_key, valid_until
 
@@ -277,8 +335,11 @@ def ensure_valid_algolia_key():
             refresh_algolia_key()
 
 
-def algolia_request(request_data):
+def algolia_requests(requests_data):
     global ALGOLIA_API_KEY, ALGOLIA_KEY_VALID_UNTIL
+
+    if not requests_data:
+        return []
 
     ensure_valid_algolia_key()
 
@@ -294,7 +355,7 @@ def algolia_request(request_data):
             r = session.post(
                 ALGOLIA_URL,
                 headers=headers,
-                json={"requests": [request_data]},
+                json={"requests": requests_data},
                 timeout=60,
             )
         except requests.RequestException as e:
@@ -306,9 +367,12 @@ def algolia_request(request_data):
 
         if r.status_code == 200:
             results = r.json().get("results", [])
-            if not results:
-                raise RuntimeError("Algolia returnerte ingen resultater.")
-            return results[0]
+            if len(results) != len(requests_data):
+                raise RuntimeError(
+                    "Algolia returnerte feil antall resultater "
+                    f"({len(results)} av {len(requests_data)})."
+                )
+            return results
 
         text = r.text
         lower = text.lower()
@@ -330,6 +394,10 @@ def algolia_request(request_data):
         raise RuntimeError(f"Algolia HTTP {r.status_code}: {text[:1200]}")
 
     raise RuntimeError("Algolia-request feilet etter tre forsøk.")
+
+
+def algolia_request(request_data):
+    return algolia_requests([request_data])[0]
 
 
 # ============================================================
@@ -748,19 +816,12 @@ def split_partition(filters, count, description, root_category, depth=0):
 def get_stocked_store_ids(hit):
     stores = hit.get("storesWithStock")
 
-    if isinstance(stores, list):
-        return {str(x) for x in stores}
+    if not isinstance(stores, list):
+        raise RuntimeError(
+            "Produktdata mangler en gyldig storesWithStock-liste."
+        )
 
-    department = hit.get("departmentStock")
-
-    if not isinstance(department, dict):
-        return set()
-
-    return {
-        str(store_id)
-        for store_id, stock in department.items()
-        if isinstance(stock, dict) and stock.get("inStock") is True
-    }
+    return {str(x) for x in stores}
 
 
 def hit_to_row(hit):
@@ -853,43 +914,16 @@ def insert_hits(conn, hits):
 
 
 def fetch_partition_to_db(conn, filters, expected_count):
-    downloaded = 0
-    new_skus = 0
-
-    first = algolia_request({
-        "indexName": INDEX_NAME,
-        "query": "",
-        "page": 0,
-        "hitsPerPage": HITS_PER_PAGE,
-        "attributesToRetrieve": PRODUCT_ATTRIBUTES,
-        "analytics": False,
-        "clickAnalytics": False,
-        "facetFilters": filters,
-    })
-
-    actual_total = int(first.get("nbHits", expected_count))
-
-    if actual_total != expected_count:
-        raise CatalogChangedError(
-            "Partisjonen endret størrelse under analysen "
-            f"({expected_count:,} planlagt, {actual_total:,} nå)."
-        )
-
-    if actual_total > MAX_RETRIEVABLE:
+    if expected_count > MAX_RETRIEVABLE:
         raise RuntimeError(
-            f"Partisjon har nå {actual_total:,} produkter og må splittes videre."
+            f"Partisjon har {expected_count:,} produkter og må splittes videre."
         )
 
-    hits = first.get("hits", [])
-    downloaded += len(hits)
-    new_skus += insert_hits(conn, hits)
+    pages = max(1, math.ceil(expected_count / HITS_PER_PAGE))
+    requests_data = []
 
-    del hits, first
-
-    pages = math.ceil(actual_total / HITS_PER_PAGE)
-
-    for page in range(1, pages):
-        result = algolia_request({
+    for page in range(pages):
+        requests_data.append({
             "indexName": INDEX_NAME,
             "query": "",
             "page": page,
@@ -900,20 +934,76 @@ def fetch_partition_to_db(conn, filters, expected_count):
             "facetFilters": filters,
         })
 
+    results = algolia_requests(requests_data)
+    all_hits = []
+
+    for expected_page, result in enumerate(results):
+        actual_total = int(result.get("nbHits", -1))
+        exhaustive = result.get("exhaustive")
+        count_is_exhaustive = result.get("exhaustiveNbHits", True)
+
+        if isinstance(exhaustive, dict):
+            count_is_exhaustive = exhaustive.get(
+                "nbHits",
+                count_is_exhaustive,
+            )
+
+        if count_is_exhaustive is False:
+            raise CatalogChangedError(
+                "Algolia returnerte et omtrentlig partisjonstall."
+            )
+
+        if actual_total != expected_count:
+            raise CatalogChangedError(
+                "Partisjonen endret størrelse under analysen "
+                f"({expected_count:,} planlagt, {actual_total:,} nå)."
+            )
+
+        actual_page = int(result.get("page", expected_page))
+        if actual_page != expected_page:
+            raise CatalogChangedError(
+                "Algolia returnerte sidene i uventet rekkefølge "
+                f"({actual_page} i stedet for {expected_page})."
+            )
+
         hits = result.get("hits", [])
-        downloaded += len(hits)
-        new_skus += insert_hits(conn, hits)
-        empty = not hits
+        if not isinstance(hits, list):
+            raise RuntimeError("Algolia returnerte ugyldige produktdata.")
+        all_hits.extend(hits)
 
-        del hits, result
+    downloaded = len(all_hits)
 
-        if empty:
-            break
-
-    if downloaded != actual_total:
+    if downloaded != expected_count:
         raise CatalogChangedError(
             "Algolia leverte ikke alle produktene i partisjonen "
-            f"({downloaded:,} av {actual_total:,})."
+            f"({downloaded:,} av {expected_count:,})."
+        )
+
+    skus = []
+
+    for hit in all_hits:
+        if not isinstance(hit, dict):
+            raise RuntimeError("Algolia returnerte et ugyldig produkt.")
+
+        sku = str(hit.get("articleNumber", "")).strip()
+        if not sku or hit.get("sellerName") != "Elkjøp":
+            raise CatalogChangedError(
+                "Partisjonen inneholder et produkt uten gyldig Elkjøp-SKU."
+            )
+        skus.append(sku)
+
+    if len(set(skus)) != expected_count:
+        raise CatalogChangedError(
+            "Partisjonen inneholder duplikate eller manglende SKU-er "
+            f"({len(set(skus)):,} unike av {expected_count:,})."
+        )
+
+    new_skus = insert_hits(conn, all_hits)
+
+    if new_skus != expected_count:
+        raise CatalogChangedError(
+            "Partisjonen overlapper tidligere produktdata "
+            f"({new_skus:,} nye av {expected_count:,})."
         )
 
     conn.commit()

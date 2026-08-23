@@ -5,7 +5,7 @@ Elkjøp Stord ikke har på lager, men som mange andre butikker har.
 
 ## Funksjoner
 
-- automatisk henting og fornying av Algolia-nøkkel via Playwright
+- rask, automatisk henting og fornying av Algolia-nøkkel, med Playwright som reserve
 - kun produkter med `sellerName=Elkjøp`
 - ekskluderer Phonehouse og Outlet fra sammenligningen
 - kategori-filter
@@ -20,6 +20,7 @@ Elkjøp Stord ikke har på lager, men som mange andre butikker har.
 - eksport av valgte eller alle filtrerte produkter
 - knapp for å kjøre ny analyse
 - tapsfri katalogpassering uten sekvensielle worker-prosesser
+- batchede Algolia-sider og full kontroll av treff, sider og unike SKU-er
 - analysen fortsetter på serveren selv om nettleseren lukkes
 - analysestatus og rapport oppdateres automatisk mens jobben kjører
 - beskytter mot flere samtidige analyser

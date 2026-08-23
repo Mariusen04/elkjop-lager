@@ -1,0 +1,8 @@
+ankervold.no, lager.ankervold.no {
+	encode zstd gzip
+	reverse_proxy elkjop-lager:8080
+}
+
+www.ankervold.no {
+	redir https://ankervold.no{uri} permanent
+}

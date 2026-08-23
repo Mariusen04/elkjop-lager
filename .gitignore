@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env*
+data/
+caddy-data/
+caddy-config/
+
+.analyse.lock
+analyse.log
+analyse_status.json
+elkjop_products.sqlite3
+elkjop_run_meta.json
+stord_mangler_elkjop.csv
+ulosbare_grupper.csv
+*.csv.tmp
+*.json.tmp

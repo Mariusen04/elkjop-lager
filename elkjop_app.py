@@ -5,12 +5,15 @@ import re
 import json
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
+import extra_streamlit_components as stx
+
+from auth_utils import create_remember_token, validate_remember_token
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -21,8 +24,19 @@ DATA_DIR = Path(
 CSV_FILE = DATA_DIR / "stord_mangler_elkjop.csv"
 LOG_FILE = DATA_DIR / "analyse.log"
 LOCK_FILE = DATA_DIR / ".analyse.lock"
+STATUS_FILE = DATA_DIR / "analyse_status.json"
 LOCK_MAX_AGE_SECONDS = 12 * 60 * 60
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Europe/Oslo")
+AUTH_COOKIE_NAME = "elkjop_lager_auth"
+AUTH_COOKIE_SECRET = os.environ.get("APP_AUTH_SECRET", "").strip()
+
+try:
+    AUTH_COOKIE_DAYS = min(
+        365,
+        max(1, int(os.environ.get("APP_AUTH_COOKIE_DAYS", "30"))),
+    )
+except ValueError:
+    AUTH_COOKIE_DAYS = 30
 
 
 st.set_page_config(
@@ -30,6 +44,8 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
+
+cookie_controller = stx.CookieManager(key="elkjop_auth_cookies")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -78,6 +94,60 @@ def read_analysis_lock():
         return {"started_at": None}
 
 
+def read_analysis_log():
+    if not LOG_FILE.exists():
+        return ""
+
+    try:
+        return LOG_FILE.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )[-30000:]
+    except OSError:
+        return ""
+
+
+def read_analysis_status():
+    if not STATUS_FILE.exists():
+        return {}
+
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        return status if isinstance(status, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def get_analysis_progress(log_text):
+    partition_matches = list(re.finditer(
+        r"\[(\d+)/(\d+)\]\s+partisjon-\d+\s+\(([^)]+)\)",
+        log_text,
+    ))
+    unique_matches = list(re.finditer(
+        r"TOTALT UNIKE:\s*([\d,. ]+)",
+        log_text,
+    ))
+
+    progress = {
+        "current": 0,
+        "total": 0,
+        "partition_size": "",
+        "unique": 0,
+    }
+
+    if partition_matches:
+        latest = partition_matches[-1]
+        progress["current"] = int(latest.group(1))
+        progress["total"] = int(latest.group(2))
+        progress["partition_size"] = latest.group(3)
+
+    if unique_matches:
+        raw_number = re.sub(r"[^0-9]", "", unique_matches[-1].group(1))
+        progress["unique"] = int(raw_number) if raw_number else 0
+
+    return progress
+
+
 # ============================================================
 # AVDELING / UNDERKATEGORI
 # ============================================================
@@ -106,26 +176,109 @@ def parse_taxonomy_path(value, fallback_category=""):
 # PASSORD
 # ============================================================
 
+def set_login_cookie(password):
+    token = create_remember_token(
+        password,
+        AUTH_COOKIE_SECRET,
+        AUTH_COOKIE_DAYS,
+    )
+    cookie_controller.set(
+        cookie=AUTH_COOKIE_NAME,
+        val=token,
+        key="elkjop_auth_cookie_set",
+        path="/",
+        expires_at=datetime.now() + timedelta(days=AUTH_COOKIE_DAYS),
+        max_age=AUTH_COOKIE_DAYS * 24 * 60 * 60,
+        secure=True,
+        same_site="strict",
+    )
+
+
+def forget_login_cookie():
+    # En utløpt cookie med Max-Age=0 fungerer også når komponentens lokale
+    # cookie-cache ennå ikke er ferdig lastet.
+    cookie_controller.set(
+        cookie=AUTH_COOKIE_NAME,
+        val="",
+        key="elkjop_auth_cookie_forget",
+        path="/",
+        expires_at=datetime.now() - timedelta(days=1),
+        max_age=0,
+        secure=True,
+        same_site="strict",
+    )
+
+
+def request_logout():
+    st.session_state["logout_requested"] = True
+
+
 def check_password():
     expected = os.environ.get("APP_PASSWORD", "").strip()
 
     if not expected:
         return True
 
+    if st.session_state.pop("logout_requested", False):
+        forget_login_cookie()
+        st.session_state["authenticated"] = False
+
+    # st.context.cookies viser cookiene fra da nettleserøkten ble opprettet.
+    # Les derfor bare remember-tokenet én gang per Streamlit-økt. Det hindrer
+    # at en bruker blir logget inn igjen av en gammel verdi rett etter logout.
+    if "authenticated" not in st.session_state:
+        remembered_token = st.context.cookies.get(AUTH_COOKIE_NAME)
+        cookie_is_valid = validate_remember_token(
+            remembered_token,
+            expected,
+            AUTH_COOKIE_SECRET,
+        )
+        st.session_state["authenticated"] = cookie_is_valid
+
+        if remembered_token and not cookie_is_valid:
+            forget_login_cookie()
+
     if st.session_state.get("authenticated"):
         return True
 
-    st.title("🔐 Elkjøp Stord Lageranalyse")
+    login_placeholder = st.empty()
 
-    password = st.text_input(
-        "Passord",
-        type="password",
-    )
+    with login_placeholder.container():
+        st.title("🔐 Elkjøp Stord Lageranalyse")
 
-    if st.button("Logg inn", type="primary"):
+        with st.form("login_form"):
+            password = st.text_input(
+                "Passord",
+                type="password",
+            )
+            remember_login = st.checkbox(
+                f"Husk meg på denne enheten i {AUTH_COOKIE_DAYS} dager",
+                value=bool(AUTH_COOKIE_SECRET),
+                disabled=not bool(AUTH_COOKIE_SECRET),
+            )
+            submitted = st.form_submit_button(
+                "Logg inn",
+                type="primary",
+            )
+
+        if not AUTH_COOKIE_SECRET:
+            st.caption(
+                "Fast innlogging er ikke aktivert på serveren. "
+                "Vanlig innlogging virker fortsatt."
+            )
+
+    if submitted:
         if secrets.compare_digest(password, expected):
             st.session_state["authenticated"] = True
-            st.rerun()
+
+            if remember_login and AUTH_COOKIE_SECRET:
+                set_login_cookie(expected)
+            else:
+                forget_login_cookie()
+
+            login_placeholder.empty()
+            st.toast("Innlogget")
+            return True
         else:
             st.error("Feil passord.")
 
@@ -134,6 +287,16 @@ def check_password():
 
 if not check_password():
     st.stop()
+
+
+if os.environ.get("APP_PASSWORD", "").strip():
+    with st.sidebar:
+        st.button(
+            "↪ Logg ut og glem denne enheten",
+            width="stretch",
+            on_click=request_logout,
+        )
+        st.divider()
 
 
 # ============================================================
@@ -162,6 +325,8 @@ with st.sidebar:
     st.header("Analyse")
 
     lock_info = read_analysis_lock()
+    analysis_log = read_analysis_log()
+    analysis_status = read_analysis_status()
 
     if lock_info:
         started_at = lock_info.get("started_at")
@@ -171,6 +336,59 @@ with st.sidebar:
             else "ukjent tidspunkt"
         )
         st.info(f"En analyse kjører. Startet {started_text}.")
+
+        progress = get_analysis_progress(analysis_log)
+
+        if progress["total"]:
+            ratio = min(
+                max(progress["current"] - 1, 0) / progress["total"],
+                1.0,
+            )
+            st.progress(
+                ratio,
+                text=(
+                    f"Partisjon {progress['current']} av "
+                    f"{progress['total']} ({ratio * 100:.0f} % ferdig)"
+                ),
+            )
+
+            details = [
+                f"{progress['partition_size']} i aktiv partisjon"
+            ]
+
+            if progress["unique"]:
+                details.append(
+                    f"{progress['unique']:,} unike SKU-er hentet"
+                    .replace(",", " ")
+                )
+
+            st.caption(" • ".join(details))
+
+        if st.button("🔄 Oppdater status", width="stretch"):
+            st.rerun()
+    elif analysis_status.get("status") == "error":
+        finished_at = analysis_status.get("finished_at")
+        finished_text = (
+            format_timestamp(finished_at)
+            if isinstance(finished_at, (int, float))
+            else "ukjent tidspunkt"
+        )
+        error_text = str(
+            analysis_status.get("error")
+            or "Ukjent feil. Se analyseloggen."
+        )[:300]
+        st.error(
+            f"Siste analyse feilet {finished_text}. "
+            f"Forrige rapport er beholdt. {error_text}"
+        )
+    elif analysis_status.get("status") == "success":
+        finished_at = analysis_status.get("finished_at")
+        finished_text = (
+            format_timestamp(finished_at)
+            if isinstance(finished_at, (int, float))
+            else "ukjent tidspunkt"
+        )
+        st.success(f"Siste analyse fullført {finished_text}.")
 
     if st.button(
         "▶ Kjør ny analyse",
@@ -191,190 +409,44 @@ with st.sidebar:
                 encoding="utf-8",
             )
 
-            st.subheader("Status")
-
-            progress_bar = st.progress(
-                0,
-                text="Starter analysen ..."
-            )
-
-            status_box = st.empty()
-            detail_box = st.empty()
-
-            live_log = st.empty()
-
-            current_category = 0
-            total_categories = 0
-            current_worker = ""
-            total_unique = 0
-            last_lines = []
-
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(BOT_FILE),
-                ],
-                cwd=str(APP_DIR),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-            )
-
             with open(
                 LOG_FILE,
                 "a",
                 encoding="utf-8",
             ) as log:
-                assert process.stdout is not None
-
-                for raw_line in process.stdout:
-                    line = raw_line.rstrip("\n")
-
-                    log.write(raw_line)
-                    log.flush()
-
-                    last_lines.append(line)
-
-                    if len(last_lines) > 18:
-                        last_lines = last_lines[-18:]
-
-                    worker_match = re.search(
-                        r"WORKER\s+(\d+)-(\d+)\s+av\s+(\d+)",
-                        line,
-                    )
-
-                    if worker_match:
-                        current_worker = (
-                            f"Worker {worker_match.group(1)}–"
-                            f"{worker_match.group(2)}"
-                        )
-
-                    category_match = re.search(
-                        r"\[(\d+)/(\d+)\]\s+([^\s]+)\s+\(([^)]+)\)",
-                        line,
-                    )
-
-                    if category_match:
-                        current_category = int(
-                            category_match.group(1)
-                        )
-
-                        total_categories = int(
-                            category_match.group(2)
-                        )
-
-                        category_name = (
-                            category_match.group(3)
-                        )
-
-                        category_count = (
-                            category_match.group(4)
-                        )
-
-                        percent = min(
-                            current_category
-                            / max(total_categories, 1),
-                            1.0,
-                        )
-
-                        progress_bar.progress(
-                            percent,
-                            text=(
-                                f"{current_category}/{total_categories} "
-                                f"({percent * 100:.1f} %)"
-                            ),
-                        )
-
-                        status_box.info(
-                            f"Behandler **{category_name}** "
-                            f"({category_count})"
-                        )
-
-                    unique_match = re.search(
-                        r"TOTALT UNIKE:\s*([\d,\. ]+)",
-                        line,
-                    )
-
-                    if unique_match:
-                        raw_number = (
-                            unique_match.group(1)
-                            .replace(",", "")
-                            .replace(".", "")
-                            .replace(" ", "")
-                        )
-
-                        if raw_number.isdigit():
-                            total_unique = int(raw_number)
-
-                    details = []
-
-                    if current_worker:
-                        details.append(current_worker)
-
-                    if total_unique:
-                        details.append(
-                            f"{total_unique:,} unike SKU-er"
-                            .replace(",", " ")
-                        )
-
-                    if details:
-                        detail_box.caption(
-                            " • ".join(details)
-                        )
-
-                    live_log.code(
-                        "\n".join(last_lines),
-                        language=None,
-                    )
-
-            returncode = process.wait()
-
-            with open(
-                LOG_FILE,
-                "a",
-                encoding="utf-8",
-            ) as log:
-                log.write(
-                    "\n\n"
-                    "===== PROCESS EXIT CODE: "
-                    f"{returncode} =====\n"
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(BOT_FILE),
+                    ],
+                    cwd=str(APP_DIR),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
                 )
 
-            if returncode == 0:
-                progress_bar.progress(
-                    1.0,
-                    text="100 % – ferdig"
-                )
-                status_box.success(
-                    "✅ Analysen er ferdig."
+            # Gi boten et kort øyeblikk til å opprette låsefilen. Selve
+            # analysen fortsetter frakoblet nettleserøkten.
+            for _ in range(20):
+                if LOCK_FILE.exists() or process.poll() is not None:
+                    break
+                time.sleep(0.1)
+
+            if process.poll() is None:
+                st.toast(
+                    "Analysen er startet og fortsetter selv om siden lukkes."
                 )
                 st.rerun()
             else:
-                status_box.error(
-                    "Analysen feilet. "
-                    f"Exit code: {returncode}"
+                st.error(
+                    "Analysen kunne ikke starte. Se analyseloggen under."
                 )
-
-                if returncode in (-9, 137):
-                    st.warning(
-                        "Prosessen ble drept av systemet. "
-                        "Dette skyldes ofte RAM-grensen."
-                    )
 
     if LOG_FILE.exists():
         with st.expander("Vis siste analyselog"):
-            try:
-                log_text = LOG_FILE.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                st.code(log_text[-30000:])
-            except Exception as error:
-                st.write(
-                    "Kunne ikke lese logg: "
-                    f"{error}"
-                )
+            st.code(analysis_log or read_analysis_log())
 
     st.divider()
 

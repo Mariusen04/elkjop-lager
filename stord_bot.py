@@ -8,7 +8,6 @@ import base64
 import sqlite3
 import json
 import gc
-import subprocess
 import secrets
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -33,22 +32,19 @@ ALGOLIA_URL = "https://z0fl7r8ubh-dsn.algolia.net/1/indexes/*/queries"
 STOREFINDER_URL = "https://www.elkjop.no/api/trpc/location.getStoreFinderStores"
 
 MAX_RETRIEVABLE = 1500
+PARTITION_TARGET = 1400
+MAX_FILTER_VALUES_PER_GROUP = 200
 HITS_PER_PAGE = 500
 MAX_SPLIT_DEPTH = 10
 
-# Viktig for Railway: hver worker avsluttes helt etter noen kategorier,
-# slik at Linux frigjør hele prosessens RAM.
-WORKER_CHUNK_SIZE = 200
-
 KEY_REFRESH_MARGIN = 75
-SPLIT_TOLERANCE_PERCENT = 0.005
-SPLIT_TOLERANCE_MIN = 10
 
 BASE_FILTERS = ["sellerName:Elkjøp"]
 
 SPLIT_FACETS = [
     "ptLowestLevelNodeValue",
     "brand",
+    "price.amount",
     "sellerName",
     "retailItemCategoryGroup",
     "articleRole",
@@ -83,12 +79,32 @@ META_FILE = DATA_DIR / "elkjop_run_meta.json"
 REPORT_FILE = DATA_DIR / "stord_mangler_elkjop.csv"
 UNRESOLVED_FILE = DATA_DIR / "ulosbare_grupper.csv"
 LOCK_FILE = DATA_DIR / ".analyse.lock"
+STATUS_FILE = DATA_DIR / "analyse_status.json"
 LOCK_MAX_AGE_SECONDS = 12 * 60 * 60
 
 session = requests.Session()
 ALGOLIA_API_KEY = None
 ALGOLIA_KEY_VALID_UNTIL = None
-WORKER_UNRESOLVED = []
+UNRESOLVED = []
+
+
+class CatalogChangedError(RuntimeError):
+    """Katalogen endret seg mellom planlegging og nedlasting."""
+
+
+def write_analysis_status(status, **details):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": status,
+        "updated_at": time.time(),
+        **details,
+    }
+    temporary_file = STATUS_FILE.with_suffix(".json.tmp")
+    temporary_file.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(temporary_file, STATUS_FILE)
 
 
 def acquire_analysis_lock():
@@ -372,41 +388,71 @@ def test_algolia():
     print(flush=True)
 
 
-def get_taxonomy_facets():
-    print("Henter produktkategorier for Elkjøp-selger ...", flush=True)
+def get_catalog_count():
+    print("Henter størrelsen på Elkjøp-katalogen ...", flush=True)
 
     result = algolia_request({
         "indexName": INDEX_NAME,
         "query": "",
         "hitsPerPage": 0,
-        "facets": ["productTaxonomy.id"],
+        "facets": ["brand"],
         "maxValuesPerFacet": 1000,
         "analytics": False,
         "clickAnalytics": False,
         "facetFilters": BASE_FILTERS,
     })
 
-    facets = result.get("facets", {}).get("productTaxonomy.id", {})
+    exhaustive = result.get("exhaustive")
+    count_is_exhaustive = result.get("exhaustiveNbHits", True)
 
-    categories = [
-        {"id": taxonomy_id, "count": int(count)}
-        for taxonomy_id, count in facets.items()
-    ]
+    if isinstance(exhaustive, dict):
+        count_is_exhaustive = exhaustive.get(
+            "nbHits",
+            count_is_exhaustive,
+        )
 
-    # STØRSTE FØRST:
-    # PT793 og andre tunge kategorier kjøres mens workeren har fersk nøkkel
-    # og lavt RAM-forbruk.
-    categories.sort(key=lambda x: x["count"], reverse=True)
+    if count_is_exhaustive is False:
+        raise RuntimeError(
+            "Algolia returnerte et omtrentlig katalogtall. "
+            "Analysen avbrytes for å unngå hull."
+        )
 
-    return categories
+    catalog_count = int(result.get("nbHits", 0))
+    brand_values = result.get("facets", {}).get("brand", {})
+    brand_count = sum(int(count) for count in brand_values.values())
+
+    if len(brand_values) >= 1000 or brand_count != catalog_count:
+        raise RuntimeError(
+            "Merke-facetten dekker ikke katalogen nøyaktig "
+            f"({brand_count:,} av {catalog_count:,})."
+        )
+
+    return catalog_count
 
 
-def make_category_filters(taxonomy_id):
-    return BASE_FILTERS + [f"productTaxonomy.id:{taxonomy_id}"]
+def make_facet_filter(facet_name, facet_value):
+    value = str(facet_value)
+
+    if value.startswith("-"):
+        value = "\\" + value
+
+    return f"{facet_name}:{value}"
 
 
 def add_filter(filters, facet_name, facet_value):
-    return list(filters) + [f"{facet_name}:{facet_value}"]
+    return list(filters) + [make_facet_filter(facet_name, facet_value)]
+
+
+def add_filter_group(filters, facet_name, facet_values):
+    group = [
+        make_facet_filter(facet_name, value)
+        for value in facet_values
+    ]
+
+    if len(group) == 1:
+        return list(filters) + group
+
+    return list(filters) + [group]
 
 
 # ============================================================
@@ -467,8 +513,8 @@ def db_count(conn):
     return int(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0])
 
 
-def save_worker_unresolved(conn):
-    if not WORKER_UNRESOLVED:
+def save_unresolved(conn):
+    if not UNRESOLVED:
         return
 
     conn.executemany(
@@ -478,7 +524,7 @@ def save_worker_unresolved(conn):
         """,
         [
             (x["category"], int(x["count"]), x["reason"])
-            for x in WORKER_UNRESOLVED
+            for x in UNRESOLVED
         ],
     )
     conn.commit()
@@ -503,10 +549,28 @@ def find_best_split(filters, parent_count):
     current_count = int(result.get("nbHits", parent_count))
     facets = result.get("facets", {})
 
-    allowed = max(
-        SPLIT_TOLERANCE_MIN,
-        int(current_count * SPLIT_TOLERANCE_PERCENT),
-    )
+    if current_count != parent_count:
+        raise CatalogChangedError(
+            "Katalogen endret seg under planleggingen "
+            f"({parent_count:,} planlagt, {current_count:,} nå)."
+        )
+
+    exhaustive = result.get("exhaustive")
+    facets_are_exhaustive = result.get("exhaustiveFacetsCount", True)
+
+    if isinstance(exhaustive, dict):
+        facets_are_exhaustive = exhaustive.get(
+            "facetsCount",
+            facets_are_exhaustive,
+        )
+
+    if facets_are_exhaustive is False:
+        print(
+            "   ⚠ Algolia returnerte omtrentlige facet-tall; "
+            "splitten avvises.",
+            flush=True,
+        )
+        return None
 
     candidates = []
 
@@ -524,7 +588,10 @@ def find_best_split(filters, parent_count):
         difference = abs(sum(counts) - current_count)
         largest = max(counts)
 
-        if difference > allowed or largest >= current_count:
+        # Gruppering med OR-filter er bare tapsfri når facet-verdiene dekker
+        # hele utvalget nøyaktig én gang. Avvis derfor både manglende verdier
+        # og array-facets med overlappende tellinger.
+        if difference != 0 or largest >= current_count:
             continue
 
         candidates.append({
@@ -549,6 +616,37 @@ def find_best_split(filters, parent_count):
     return candidates[0]
 
 
+def pack_facet_values(values):
+    """Pakker gjensidig utelukkende facet-verdier i grupper under API-taket."""
+    packed = []
+
+    for facet_value, raw_count in sorted(
+        values.items(),
+        key=lambda item: int(item[1]),
+        reverse=True,
+    ):
+        count = int(raw_count)
+
+        if count <= 0 or count > PARTITION_TARGET:
+            continue
+
+        for group in packed:
+            if (
+                len(group["values"]) < MAX_FILTER_VALUES_PER_GROUP
+                and group["count"] + count <= PARTITION_TARGET
+            ):
+                group["values"].append(facet_value)
+                group["count"] += count
+                break
+        else:
+            packed.append({
+                "values": [facet_value],
+                "count": count,
+            })
+
+    return packed
+
+
 def split_partition(filters, count, description, root_category, depth=0):
     indent = "   " * depth
 
@@ -560,7 +658,7 @@ def split_partition(filters, count, description, root_category, depth=0):
         }]
 
     if depth >= MAX_SPLIT_DEPTH:
-        WORKER_UNRESOLVED.append({
+        UNRESOLVED.append({
             "category": root_category,
             "count": count,
             "reason": "Maks splittdybde: " + description,
@@ -577,7 +675,7 @@ def split_partition(filters, count, description, root_category, depth=0):
             flush=True,
         )
 
-        WORKER_UNRESOLVED.append({
+        UNRESOLVED.append({
             "category": root_category,
             "count": count,
             "reason": "Kunne ikke splitte: " + description,
@@ -587,14 +685,24 @@ def split_partition(filters, count, description, root_category, depth=0):
 
     print(
         f"{indent}   bruker facet: {split['facet']} "
-        f"({split['bucket_count']} grupper, "
-        f"største {split['largest']:,}, avvik {split['difference']})",
+        f"({split['bucket_count']} verdier, "
+        f"største {split['largest']:,}, nøyaktig dekning)",
         flush=True,
     )
 
     final_partitions = []
 
-    for facet_value, bucket_count in split["values"].items():
+    oversized_values = [
+        (facet_value, int(bucket_count))
+        for facet_value, bucket_count in split["values"].items()
+        if int(bucket_count) > PARTITION_TARGET
+    ]
+
+    for facet_value, bucket_count in sorted(
+        oversized_values,
+        key=lambda item: item[1],
+        reverse=True,
+    ):
         child_filters = add_filter(filters, split["facet"], facet_value)
 
         child_description = (
@@ -610,6 +718,25 @@ def split_partition(filters, count, description, root_category, depth=0):
                 depth + 1,
             )
         )
+
+    packed_groups = pack_facet_values(split["values"])
+
+    for group_number, group in enumerate(packed_groups, start=1):
+        group_filters = add_filter_group(
+            filters,
+            split["facet"],
+            group["values"],
+        )
+        group_description = (
+            f"{description} / {split['facet']}-gruppe-{group_number} "
+            f"({len(group['values'])} verdier)"
+        )
+
+        final_partitions.append({
+            "filters": group_filters,
+            "count": group["count"],
+            "description": group_description,
+        })
 
     return final_partitions
 
@@ -722,8 +849,6 @@ def insert_hits(conn, hits):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
-    conn.commit()
-
     return conn.total_changes - before
 
 
@@ -744,6 +869,12 @@ def fetch_partition_to_db(conn, filters, expected_count):
 
     actual_total = int(first.get("nbHits", expected_count))
 
+    if actual_total != expected_count:
+        raise CatalogChangedError(
+            "Partisjonen endret størrelse under analysen "
+            f"({expected_count:,} planlagt, {actual_total:,} nå)."
+        )
+
     if actual_total > MAX_RETRIEVABLE:
         raise RuntimeError(
             f"Partisjon har nå {actual_total:,} produkter og må splittes videre."
@@ -754,7 +885,6 @@ def fetch_partition_to_db(conn, filters, expected_count):
     new_skus += insert_hits(conn, hits)
 
     del hits, first
-    gc.collect()
 
     pages = math.ceil(actual_total / HITS_PER_PAGE)
 
@@ -780,108 +910,106 @@ def fetch_partition_to_db(conn, filters, expected_count):
         if empty:
             break
 
-        time.sleep(0.02)
+    if downloaded != actual_total:
+        raise CatalogChangedError(
+            "Algolia leverte ikke alle produktene i partisjonen "
+            f"({downloaded:,} av {actual_total:,})."
+        )
+
+    conn.commit()
 
     return downloaded, new_skus
 
 
 # ============================================================
-# WORKER
+# KATALOGHENTING
 # ============================================================
 
-def worker_main(start_index, end_index):
-    global WORKER_UNRESOLVED
+def fetch_catalog(conn, catalog_count):
+    global UNRESOLVED
 
-    WORKER_UNRESOLVED = []
+    UNRESOLVED = []
 
-    meta = json.loads(META_FILE.read_text(encoding="utf-8"))
-    categories = meta["categories"]
+    print()
+    print("Planlegger tapsfrie katalogpartisjoner ...", flush=True)
 
-    conn = open_database()
-
-    try:
-        print()
-        print("=" * 80, flush=True)
-        print(
-            f"WORKER {start_index + 1}-{end_index} "
-            f"av {len(categories)} kategorier",
-            flush=True,
-        )
-        print("Ny Python-prosess = frigjort RAM", flush=True)
-        print("=" * 80, flush=True)
-
-        # Hver worker starter med fersk ~15-minutters nøkkel.
-        refresh_algolia_key()
-
-        for index in range(start_index, end_index):
-            category = categories[index]
-            taxonomy_id = category["id"]
-            count = int(category["count"])
-
-            print()
-            print(
-                f"[{index + 1}/{len(categories)}] "
-                f"{taxonomy_id} ({count:,} produkter)",
-                flush=True,
-            )
-
-            filters = make_category_filters(taxonomy_id)
-
-            if count <= MAX_RETRIEVABLE:
-                partitions = [{
-                    "filters": filters,
-                    "count": count,
-                    "description": taxonomy_id,
-                }]
-            else:
-                partitions = split_partition(
-                    filters,
-                    count,
-                    taxonomy_id,
-                    taxonomy_id,
-                )
-
-            downloaded = 0
-            new_skus = 0
-
-            for partition in partitions:
-                try:
-                    d, new = fetch_partition_to_db(
-                        conn,
-                        partition["filters"],
-                        partition["count"],
-                    )
-
-                    downloaded += d
-                    new_skus += new
-
-                except Exception as e:
-                    print(f"   ⚠ FEIL: {e}", flush=True)
-
-                    WORKER_UNRESOLVED.append({
-                        "category": taxonomy_id,
-                        "count": partition["count"],
-                        "reason": str(e),
-                    })
-
-            print(f"   hentet: {downloaded:,}", flush=True)
-            print(f"   nye SKU-er: {new_skus:,}", flush=True)
-            print(f"   TOTALT UNIKE: {db_count(conn):,}", flush=True)
-
-            del partitions
-            gc.collect()
-
-        save_worker_unresolved(conn)
-
-    finally:
-        conn.close()
-        gc.collect()
+    partitions = split_partition(
+        BASE_FILTERS,
+        catalog_count,
+        "hele-katalogen",
+        "hele-katalogen",
+    )
+    planned_count = sum(
+        int(partition["count"])
+        for partition in partitions
+    )
 
     print(
-        f"\n✓ Worker {start_index + 1}-{end_index} ferdig. "
-        "Prosessen avsluttes og RAM frigjøres.",
+        f"✓ {len(partitions)} partisjoner dekker "
+        f"{planned_count:,} av {catalog_count:,} produkter.",
         flush=True,
     )
+
+    if planned_count != catalog_count:
+        save_unresolved(conn)
+        save_unresolved_csv(conn)
+        raise RuntimeError(
+            "Partisjonsplanen dekker ikke hele katalogen "
+            f"({planned_count:,} av {catalog_count:,})."
+        )
+
+    for index, partition in enumerate(partitions, start=1):
+        print()
+        print(
+            f"[{index}/{len(partitions)}] "
+            f"partisjon-{index} ({partition['count']:,} produkter)",
+            flush=True,
+        )
+        print(f"   {partition['description']}", flush=True)
+
+        try:
+            downloaded, new_skus = fetch_partition_to_db(
+                conn,
+                partition["filters"],
+                partition["count"],
+            )
+        except CatalogChangedError:
+            conn.rollback()
+            raise
+        except Exception as error:
+            conn.rollback()
+            print(f"   ⚠ FEIL: {error}", flush=True)
+
+            UNRESOLVED.append({
+                "category": partition["description"],
+                "count": partition["count"],
+                "reason": str(error),
+            })
+            continue
+
+        print(f"   hentet: {downloaded:,}", flush=True)
+        print(f"   nye SKU-er: {new_skus:,}", flush=True)
+        print(f"   TOTALT UNIKE: {db_count(conn):,}", flush=True)
+
+    save_unresolved(conn)
+
+    if UNRESOLVED:
+        save_unresolved_csv(conn)
+        raise RuntimeError(
+            f"{len(UNRESOLVED)} partisjoner kunne ikke hentes. "
+            "Den forrige rapporten beholdes."
+        )
+
+    unique_count = db_count(conn)
+
+    if unique_count != catalog_count:
+        raise CatalogChangedError(
+            "Kontrollen av unike SKU-er feilet "
+            f"({unique_count:,} av {catalog_count:,}). "
+            "Den forrige rapporten beholdes."
+        )
+
+    gc.collect()
 
 
 # ============================================================
@@ -1085,10 +1213,7 @@ def master_main():
     print("Kun produkter solgt av Elkjøp", flush=True)
     print("Algolia-nøkkel: AUTOMATISK", flush=True)
     print("Lagring: SQLITE", flush=True)
-    print(
-        f"RAM-modus: WORKERS / {WORKER_CHUNK_SIZE} KATEGORIER PER PROSESS",
-        flush=True,
-    )
+    print("Modus: ÉN TAPFRI KATALOGPASSERING", flush=True)
     print("=" * 80, flush=True)
 
     for path in [
@@ -1100,7 +1225,6 @@ def master_main():
 
     create_database()
 
-    # Bootstrap-data. Etter dette kjører tunge produktjobber i separate workers.
     refresh_algolia_key()
 
     print("\nHenter butikklisten ...", flush=True)
@@ -1117,93 +1241,58 @@ def master_main():
     print(f"✓ {STORD_ID} = {stores[STORD_ID]}\n", flush=True)
 
     test_algolia()
-    categories = get_taxonomy_facets()
-
-    oversized = sum(
-        1
-        for c in categories
-        if c["count"] > MAX_RETRIEVABLE
-    )
+    catalog_count = get_catalog_count()
 
     print(
-        f"✓ Fant {len(categories)} kategorier for Elkjøp-produkter.",
+        f"✓ Fant {catalog_count:,} Elkjøp-produkter.",
         flush=True,
     )
-    print(
-        f"✓ {oversized} kategorier må splittes.",
-        flush=True,
-    )
-    print("✓ Største kategorier kjøres først.", flush=True)
 
     META_FILE.write_text(
         json.dumps(
             {
                 "stores": stores,
-                "categories": categories,
+                "catalog_count": catalog_count,
             },
             ensure_ascii=False,
         ),
         encoding="utf-8",
     )
 
-    # Frigjør bootstrap-objekter før workers.
-    del categories
-    gc.collect()
-
-    meta = json.loads(META_FILE.read_text(encoding="utf-8"))
-    total_categories = len(meta["categories"])
-    del meta
-    gc.collect()
-
-    worker_number = 0
-
-    for start in range(0, total_categories, WORKER_CHUNK_SIZE):
-        end = min(
-            start + WORKER_CHUNK_SIZE,
-            total_categories,
-        )
-        worker_number += 1
-
-        print()
-        print(
-            f"🚀 Starter worker {worker_number}: "
-            f"kategori {start + 1}-{end}",
-            flush=True,
-        )
-
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--worker",
-                str(start),
-                str(end),
-            ],
-            cwd=str(Path.cwd()),
-        )
-
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"Worker {worker_number} feilet "
-                f"med exit code {completed.returncode}."
-            )
-
-        print(
-            f"✓ Worker {worker_number} avsluttet. "
-            "RAM er nå frigjort.",
-            flush=True,
-        )
-        gc.collect()
-
-    # Sluttanalyse er lett: databasen leses 500 rader av gangen,
-    # og bare de ~hundre relevante treffene beholdes.
-    meta = json.loads(META_FILE.read_text(encoding="utf-8"))
-    stores = meta["stores"]
-    del meta
-
     conn = open_database()
 
     try:
+        for attempt in range(2):
+            try:
+                fetch_catalog(conn, catalog_count)
+                break
+            except CatalogChangedError:
+                if attempt == 1:
+                    raise
+
+                print()
+                print(
+                    "↻ Katalogen endret seg under hentingen. "
+                    "Planlegger hele passeringen på nytt én gang ...",
+                    flush=True,
+                )
+
+                conn.execute("DELETE FROM products")
+                conn.execute("DELETE FROM unresolved")
+                conn.commit()
+
+                catalog_count = get_catalog_count()
+                META_FILE.write_text(
+                    json.dumps(
+                        {
+                            "stores": stores,
+                            "catalog_count": catalog_count,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
         total_unique = db_count(conn)
 
         print()
@@ -1283,7 +1372,7 @@ def master_main():
         print("Se: ulosbare_grupper.csv", flush=True)
     else:
         print(
-            "\n✓ Alle Elkjøp-kategorier ble hentet fullstendig.",
+            "\n✓ Hele Elkjøp-katalogen ble hentet fullstendig.",
             flush=True,
         )
 
@@ -1293,32 +1382,50 @@ def master_main():
 # ============================================================
 
 if __name__ == "__main__":
-    try:
-        if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
-            if len(sys.argv) != 4:
-                raise RuntimeError(
-                    "Worker krever start- og sluttindeks."
-                )
+    analysis_lock_token = None
+    analysis_started_at = time.time()
 
-            worker_main(
-                int(sys.argv[2]),
-                int(sys.argv[3]),
-            )
-        else:
-            analysis_lock_token = acquire_analysis_lock()
-            try:
-                master_main()
-            finally:
-                release_analysis_lock(analysis_lock_token)
+    try:
+        analysis_lock_token = acquire_analysis_lock()
+        write_analysis_status(
+            "running",
+            started_at=analysis_started_at,
+        )
+        master_main()
 
     except KeyboardInterrupt:
+        if analysis_lock_token is not None:
+            write_analysis_status(
+                "error",
+                started_at=analysis_started_at,
+                finished_at=time.time(),
+                error="Avbrutt av bruker.",
+            )
         print("\nAvbrutt av bruker.", flush=True)
         sys.exit(1)
 
     except Exception as e:
+        if analysis_lock_token is not None:
+            write_analysis_status(
+                "error",
+                started_at=analysis_started_at,
+                finished_at=time.time(),
+                error=str(e)[:1000],
+            )
         print()
         print("=" * 80, flush=True)
         print("FEIL", flush=True)
         print("=" * 80, flush=True)
         print(repr(e), flush=True)
         sys.exit(1)
+
+    else:
+        write_analysis_status(
+            "success",
+            started_at=analysis_started_at,
+            finished_at=time.time(),
+        )
+
+    finally:
+        if analysis_lock_token is not None:
+            release_analysis_lock(analysis_lock_token)

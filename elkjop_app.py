@@ -827,8 +827,6 @@ st.subheader("Produkter")
 table_columns = [
     "priority",
     "percentage",
-    "stores_with_stock",
-    "stores_checked",
     "sku",
     "title",
     "brand",
@@ -837,8 +835,6 @@ table_columns = [
 table_headers = [
     "Prioritet",
     "%",
-    "Butikker med varen",
-    "Butikker sjekket",
     "SKU",
     "Produkt",
     "Merke",

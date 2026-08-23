@@ -15,7 +15,7 @@ Elkjøp Stord ikke har på lager, men som mange andre butikker har.
 - søk på SKU / produkt / merke / kategori
 - klikkbar produktlenke
 - eksport av filtrert CSV
-- avkryssing av produkter og redigerbart bestillingsantall
+- egen «Mass Entry to Store Order»-modus med produktvalg og antall
 - bestillingseksport som `SKU<TAB>antall`, klar for Mass Entry
 - eksport av valgte eller alle filtrerte produkter
 - knapp for å kjøre ny analyse

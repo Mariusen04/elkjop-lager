@@ -865,118 +865,159 @@ table_headers.extend([
 
 display_df = filtered[table_columns].copy()
 display_df.columns = table_headers
-display_df.insert(0, "Velg", False)
-display_df.insert(1, "Antall", 1)
+mass_entry_mode = st.session_state.get("mass_entry_mode", False)
 
-# Et filterbytte kan endre hvilke produkter som ligger på hver rad. Nullstill da
-# gamle avkrysninger, slik at et valg aldri flyttes til feil SKU.
-filter_signature = hash(tuple(display_df["SKU"].tolist()))
+if not mass_entry_mode:
+    if st.button(
+        "Mass Entry to Store Order",
+        type="primary",
+        width="stretch",
+        help="Velg produkter og bestillingsantall.",
+    ):
+        st.session_state["mass_entry_mode"] = True
+        st.session_state.pop("order_table", None)
+        st.rerun()
+else:
+    action_left, action_right = st.columns([3, 1])
 
-if st.session_state.get("order_table_filter_signature") != filter_signature:
-    st.session_state.pop("order_table", None)
-    st.session_state["order_table_filter_signature"] = filter_signature
+    with action_left:
+        st.info(
+            "Bestillingsmodus er aktiv. Huk av produkter og angi antall."
+        )
 
-editable_columns = {"Velg", "Antall"}
-read_only_columns = [
-    column
-    for column in display_df.columns
-    if column not in editable_columns
-]
+    with action_right:
+        if st.button("Lukk", width="stretch"):
+            st.session_state["mass_entry_mode"] = False
+            st.session_state.pop("order_table", None)
+            st.rerun()
 
-edited_df = st.data_editor(
-    display_df,
-    width="stretch",
-    hide_index=True,
-    disabled=read_only_columns,
-    key="order_table",
-    column_config={
-        "Velg": st.column_config.CheckboxColumn(
-            "Velg",
-            help="Ta med produktet i eksport av valgte varer.",
-            default=False,
-        ),
-        "Antall": st.column_config.NumberColumn(
-            "Antall",
-            help="Antallet som skal sendes til bestillingsprogrammet.",
-            min_value=1,
-            step=1,
-            format="%d",
-        ),
-        "%": st.column_config.NumberColumn(
-            format="%.1f %%"
-        ),
-        "Produktlenke": st.column_config.LinkColumn(
-            "Åpne produkt",
-            display_text="Åpne",
-        ),
-    },
-)
+common_column_config = {
+    "%": st.column_config.NumberColumn(format="%.1f %%"),
+    "Produktlenke": st.column_config.LinkColumn(
+        "Åpne produkt",
+        display_text="Åpne",
+    ),
+}
+
+if mass_entry_mode:
+    order_display_df = display_df.copy()
+    order_display_df.insert(0, "Velg", False)
+    order_display_df.insert(1, "Antall", 1)
+
+    # Et filterbytte kan endre hvilke produkter som ligger på hver rad.
+    # Nullstill gamle valg, slik at et valg aldri flyttes til feil SKU.
+    filter_signature = hash(tuple(order_display_df["SKU"].tolist()))
+
+    if (
+        st.session_state.get("order_table_filter_signature")
+        != filter_signature
+    ):
+        st.session_state.pop("order_table", None)
+        st.session_state["order_table_filter_signature"] = filter_signature
+
+    editable_columns = {"Velg", "Antall"}
+    read_only_columns = [
+        column
+        for column in order_display_df.columns
+        if column not in editable_columns
+    ]
+
+    edited_df = st.data_editor(
+        order_display_df,
+        width="stretch",
+        hide_index=True,
+        disabled=read_only_columns,
+        key="order_table",
+        column_config={
+            **common_column_config,
+            "Velg": st.column_config.CheckboxColumn(
+                "Velg",
+                help="Ta med produktet i bestillingslisten.",
+                default=False,
+            ),
+            "Antall": st.column_config.NumberColumn(
+                "Antall",
+                help="Antallet som skal sendes til bestillingsprogrammet.",
+                min_value=1,
+                step=1,
+                format="%d",
+            ),
+        },
+    )
+else:
+    st.dataframe(
+        display_df,
+        width="stretch",
+        hide_index=True,
+        column_config=common_column_config,
+    )
 
 
 # ============================================================
 # BESTILLINGSEKSPORT
 # ============================================================
 
-st.subheader("Bestillingsliste")
-st.caption(
-    "Format: SKU, tabulatortegn og antall – én vare per linje. "
-    "Listen kan limes direkte inn i Mass Entry."
-)
-
-export_scope = st.radio(
-    "Produkter som skal eksporteres",
-    [
-        "Valgte produkter",
-        "Alle filtrerte produkter",
-    ],
-    horizontal=True,
-)
-
-if export_scope == "Alle filtrerte produkter":
-    order_df = edited_df.copy()
-else:
-    order_df = edited_df[edited_df["Velg"].fillna(False)].copy()
-
-order_lines = []
-
-for sku, quantity in order_df[["SKU", "Antall"]].itertuples(
-    index=False,
-    name=None,
-):
-    sku_text = str(sku).strip()
-    numeric_quantity = pd.to_numeric(quantity, errors="coerce")
-
-    if not sku_text or pd.isna(numeric_quantity):
-        continue
-
-    order_lines.append(f"{sku_text}\t{max(1, int(numeric_quantity))}")
-
-order_text = "\n".join(order_lines)
-
-if order_text:
-    st.text_area(
-        "Kopier til Mass Entry",
-        value=order_text,
-        height=180,
-        help="Klikk i feltet, velg alt og kopier.",
-    )
+if mass_entry_mode:
+    st.subheader("Bestillingsliste")
     st.caption(
-        (
-            f"{len(order_lines):,} varelinjer. Klikk i feltet og bruk "
-            "Ctrl+A / Ctrl+C eller ⌘A / ⌘C."
-        ).replace(",", " ")
+        "Format: SKU, tabulatortegn og antall – én vare per linje. "
+        "Listen kan limes direkte inn i Mass Entry."
     )
-    st.download_button(
-        "⬇ Last ned bestillingsliste",
-        data=order_text.encode("utf-8"),
-        file_name="bestillingsliste.txt",
-        mime="text/plain",
+
+    export_scope = st.radio(
+        "Produkter som skal eksporteres",
+        [
+            "Valgte produkter",
+            "Alle filtrerte produkter",
+        ],
+        horizontal=True,
     )
-else:
-    st.info(
-        "Huk av produkter i tabellen, eller velg "
-        "**Alle filtrerte produkter**."
-    )
+
+    if export_scope == "Alle filtrerte produkter":
+        order_df = edited_df.copy()
+    else:
+        order_df = edited_df[edited_df["Velg"].fillna(False)].copy()
+
+    order_lines = []
+
+    for sku, quantity in order_df[["SKU", "Antall"]].itertuples(
+        index=False,
+        name=None,
+    ):
+        sku_text = str(sku).strip()
+        numeric_quantity = pd.to_numeric(quantity, errors="coerce")
+
+        if not sku_text or pd.isna(numeric_quantity):
+            continue
+
+        order_lines.append(f"{sku_text}\t{max(1, int(numeric_quantity))}")
+
+    order_text = "\n".join(order_lines)
+
+    if order_text:
+        st.text_area(
+            "Kopier til Mass Entry",
+            value=order_text,
+            height=180,
+            help="Klikk i feltet, velg alt og kopier.",
+        )
+        st.caption(
+            (
+                f"{len(order_lines):,} varelinjer. Klikk i feltet og bruk "
+                "Ctrl+A / Ctrl+C eller ⌘A / ⌘C."
+            ).replace(",", " ")
+        )
+        st.download_button(
+            "⬇ Last ned bestillingsliste",
+            data=order_text.encode("utf-8"),
+            file_name="bestillingsliste.txt",
+            mime="text/plain",
+        )
+    else:
+        st.info(
+            "Huk av produkter i tabellen, eller velg "
+            "**Alle filtrerte produkter**."
+        )
 
 
 csv_bytes = filtered.to_csv(
